@@ -68,6 +68,21 @@ button:disabled { opacity: .3; cursor: default; border-color: var(--line); color
   footer { justify-content: center; }
   button { width: 32px; height: 32px; }
 }
+
+/* Zoom viewer */
+.zoom { position: fixed; inset: 0; z-index: 50; background: var(--ground); display: grid; grid-template-rows: auto 1fr auto;
+  padding: env(safe-area-inset-top, 0px) max(12px, env(safe-area-inset-right, 0px)) env(safe-area-inset-bottom, 0px) max(12px, env(safe-area-inset-left, 0px)); }
+.zbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-block: 10px; }
+.zbar.bottom { justify-content: center; }
+.zlabel { font-family: var(--display); font-weight: 300; font-size: 13px; letter-spacing: .24em; text-transform: uppercase; color: var(--muted); }
+.zarea { position: relative; overflow: hidden; touch-action: none; display: flex; align-items: center; justify-content: center; cursor: grab; min-height: 0; }
+.zarea.dragging { cursor: grabbing; }
+.zcanvas { display: flex; flex: none; box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+.zcanvas img { display: block; width: 50%; height: 100%; object-fit: cover; user-select: none; -webkit-user-drag: none; pointer-events: none; }
+.zcanvas.single img { width: 100%; }
+.zlevel { font-family: var(--display); font-weight: 300; font-size: 14px; letter-spacing: .12em; min-width: 6ch; text-align: center; font-variant-numeric: tabular-nums; }
+.ztip { font-size: 12px; color: var(--muted); }
+@media (max-height: 520px) { .zbar { padding-block: 4px; } .ztip { display: none; } }
 </style>
 <style>*,*::before,*::after{box-sizing:border-box}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
 </head>
@@ -87,13 +102,28 @@ button:disabled { opacity: .3; cursor: default; border-color: var(--line); color
   <div class="rotate" id="rotate"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="7" y="2" width="10" height="18" rx="2" transform="rotate(-90 12 12) translate(0 1)"/><path d="M4 7a8 8 0 0 1 6-4M8 3l2 0 0 2"/></svg>Turn your phone sideways for a bigger view</div>
 
   <footer>
-    <span class="hint">Swipe, drag a corner, or use the arrow keys</span>
+    <span class="hint">Swipe to turn pages · tap the magnifier to zoom</span>
     <div class="controls">
       <button id="prev" aria-label="Previous page"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M10 3L5 8l5 5"/></svg></button>
       <span class="count" id="count">COVER</span>
       <button id="next" aria-label="Next page"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 3l5 5-5 5"/></svg></button>
+      <button id="zoomBtn" aria-label="Zoom in to read"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21M10.5 7.5v6M7.5 10.5h6"/></svg></button>
     </div>
   </footer>
+</div>
+
+<div class="zoom" id="zoom" hidden role="dialog" aria-label="Zoomed page view">
+  <div class="zbar">
+    <span class="zlabel" id="zlabel">Pages</span>
+    <span class="ztip">Pinch, scroll or double-tap to zoom · drag to move</span>
+    <button id="zclose" aria-label="Close zoom"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3l10 10M13 3L3 13"/></svg></button>
+  </div>
+  <div class="zarea" id="zarea"><div class="zcanvas" id="zcanvas"></div></div>
+  <div class="zbar bottom">
+    <button id="zout" aria-label="Zoom out"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 8h10"/></svg></button>
+    <span class="zlevel" id="zlevel">100%</span>
+    <button id="zin" aria-label="Zoom in"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 8h10M8 3v10"/></svg></button>
+  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/page-flip@2.0.7/dist/js/page-flip.browser.js"></script>
@@ -168,7 +198,7 @@ button:disabled { opacity: .3; cursor: default; border-color: var(--line); color
   prev.addEventListener('click', () => flip && flip.flipPrev());
   next.addEventListener('click', () => flip && flip.flipNext());
   document.addEventListener('keydown', e => {
-    if (!flip) return;
+    if (!flip || !document.getElementById('zoom').hidden) return;
     if (e.key === 'ArrowRight') flip.flipNext();
     if (e.key === 'ArrowLeft') flip.flipPrev();
   });
@@ -183,6 +213,125 @@ button:disabled { opacity: .3; cursor: default; border-color: var(--line); color
       build(flip ? flip.getCurrentPageIndex() : 0);
     }, 250);
   });
+  // ---- Zoom viewer: opens the visible spread full-screen with pinch / wheel / double-tap zoom and drag to pan.
+  const zoom = document.getElementById('zoom'), zarea = document.getElementById('zarea'), zcanvas = document.getElementById('zcanvas');
+  const zlevel = document.getElementById('zlevel'), zlabel = document.getElementById('zlabel');
+  const MAXZ = 4;
+  let zs = 1, zx = 0, zy = 0, baseW = 0, baseH = 0;
+  const pts = new Map();
+  let pinch = null, lastTap = 0, moved = false;
+
+  function visiblePages() {
+    const i = flip ? flip.getCurrentPageIndex() : 0;
+    if (i <= 0) return [1];
+    if (i >= TOTAL - 1) return [TOTAL];
+    const a = i % 2 ? i : i - 1;
+    return [a + 1, a + 2];
+  }
+  function fit() {
+    const n = zcanvas.children.length, r = zarea.getBoundingClientRect();
+    const side = Math.floor(Math.min(r.width / n, r.height) * 0.97);
+    baseW = side * n; baseH = side;
+  }
+  function clampPos() {
+    zs = Math.min(MAXZ, Math.max(1, zs));
+    const r = zarea.getBoundingClientRect();
+    const mx = Math.max(0, (baseW * zs - r.width) / 2);
+    const my = Math.max(0, (baseH * zs - r.height) / 2);
+    zx = Math.min(mx, Math.max(-mx, zx));
+    zy = Math.min(my, Math.max(-my, zy));
+  }
+  function apply() {
+    clampPos();
+    // Resize the images themselves (not a CSS scale) so the browser redraws them sharply.
+    zcanvas.style.width = Math.round(baseW * zs) + 'px';
+    zcanvas.style.height = Math.round(baseH * zs) + 'px';
+    zcanvas.style.transform = 'translate(' + zx + 'px,' + zy + 'px)';
+    zlevel.textContent = Math.round(zs * 100) + '%';
+  }
+  function zoomAt(ns, px, py) {
+    const r = zarea.getBoundingClientRect();
+    ns = Math.min(MAXZ, Math.max(1, ns));
+    const cx = (px == null ? r.left + r.width / 2 : px) - r.left - r.width / 2;
+    const cy = (py == null ? r.top + r.height / 2 : py) - r.top - r.height / 2;
+    zx = cx - (cx - zx) * (ns / zs);
+    zy = cy - (cy - zy) * (ns / zs);
+    zs = ns;
+    apply();
+  }
+  function openZoom() {
+    const pages = visiblePages();
+    zcanvas.innerHTML = '';
+    zcanvas.classList.toggle('single', pages.length === 1);
+    pages.forEach(n => {
+      const img = document.createElement('img');
+      img.src = 'p/' + String(n).padStart(2, '0') + '.jpg';
+      img.alt = n === 1 ? 'Front cover' : n === TOTAL ? 'Back cover' : 'Portfolio page ' + (n - 1);
+      zcanvas.appendChild(img);
+    });
+    zlabel.textContent = pages.length === 1 ? (pages[0] === 1 ? 'Cover' : 'Back cover')
+      : 'Pages ' + String(pages[0] - 1).padStart(2, '0') + '–' + String(pages[1] - 1).padStart(2, '0');
+    zoom.hidden = false;
+    zs = 1; zx = 0; zy = 0;
+    fit(); apply();
+    document.getElementById('zclose').focus();
+  }
+  function closeZoom() { zoom.hidden = true; pts.clear(); pinch = null; document.getElementById('zoomBtn').focus(); }
+
+  document.getElementById('zoomBtn').addEventListener('click', openZoom);
+  stage.addEventListener('dblclick', openZoom);
+  document.getElementById('zclose').addEventListener('click', closeZoom);
+  document.getElementById('zin').addEventListener('click', () => zoomAt(zs * 1.5));
+  document.getElementById('zout').addEventListener('click', () => zoomAt(zs / 1.5));
+  document.addEventListener('keydown', e => {
+    if (zoom.hidden) return;
+    if (e.key === 'Escape') closeZoom();
+    if (e.key === '+' || e.key === '=') zoomAt(zs * 1.5);
+    if (e.key === '-') zoomAt(zs / 1.5);
+  });
+  zarea.addEventListener('wheel', e => { e.preventDefault(); zoomAt(zs * Math.exp(-e.deltaY * 0.0018), e.clientX, e.clientY); }, { passive: false });
+
+  zarea.addEventListener('pointerdown', e => {
+    zarea.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    moved = false;
+    if (pts.size === 2) {
+      const [a, b] = [...pts.values()];
+      pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), s: zs };
+    }
+    zarea.classList.add('dragging');
+  });
+  zarea.addEventListener('pointermove', e => {
+    const prevP = pts.get(e.pointerId);
+    if (!prevP) return;
+    const cur = { x: e.clientX, y: e.clientY };
+    pts.set(e.pointerId, cur);
+    if (pts.size === 2 && pinch) {
+      const [a, b] = [...pts.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      zoomAt(pinch.s * d / pinch.d, (a.x + b.x) / 2, (a.y + b.y) / 2);
+      moved = true;
+    } else if (pts.size === 1) {
+      const dx = cur.x - prevP.x, dy = cur.y - prevP.y;
+      if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+      zx += dx; zy += dy; apply();
+    }
+  });
+  function endPointer(e) {
+    pts.delete(e.pointerId);
+    if (pts.size < 2) pinch = null;
+    if (pts.size === 0) {
+      zarea.classList.remove('dragging');
+      if (!moved && e.type === 'pointerup') {
+        const now = Date.now();
+        if (now - lastTap < 320) { zoomAt(zs > 1.2 ? 1 : 2.5, e.clientX, e.clientY); lastTap = 0; }
+        else lastTap = now;
+      }
+    }
+  }
+  zarea.addEventListener('pointerup', endPointer);
+  zarea.addEventListener('pointercancel', endPointer);
+  window.addEventListener('resize', () => { if (!zoom.hidden) { fit(); apply(); } });
 })();
 </script>
 </body>
